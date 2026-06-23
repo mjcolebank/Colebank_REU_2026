@@ -1,0 +1,1 @@
+Standard CNN without Bayesian
