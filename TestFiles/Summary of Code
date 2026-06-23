@@ -1,0 +1,12 @@
+SUMMARY, Code likes Tanh(), higher prior, lr 1e-3, 5-7 kernel
+
+"Here is my code and the files that go with it. It works, do not change it. 
+Here is a list of parameters I want to try for kernel size, prior, activation functions, number of filters, and learning rate. 
+Kernel_size, 3, 5, 7, 9, 11
+Prior_size, 0.25, 0.5, 0.75, 1.0, 2.5, 5, 10
+Activation functions, tanh(), sigmoid(), relu() 
+Number of filters, 8, 12, 16, 32, 64, 128
+lr, 1e-3, 5e-3, 10e-3
+Run through the code with each configuration of parameters, and store the combination used and test accuracy in a csv file. "
+
+
