@@ -346,7 +346,7 @@ def generate_and_display_comparative_metrics(model, train_loader, test_loader):
     ax[2].set_title("Confusion Matrix (Holdout Test Split)")
 
     plt.tight_layout()
-    plt.savefig("earlyfusion_cnn_optimized_metrics", dpi = 150)
+    plt.savefig("earlyfusion_cnn_optimized_metrics.png", dpi = 150)
 
 # ──────────────────────────────────────────────────────────────────────
 # 7. EXECUTION PIPELINE
@@ -355,10 +355,10 @@ if __name__ == "__main__":
     print("Beginning execution pipeline...", flush = True)
 
     # ── STEP A: DATA INGESTION ────
-    ECG_train_raw = np.load('/work/sm222/data/physionet.org/files/echonext/1.1.1/EchoNext_train_waveforms.npy')
-    ECG_val_raw   = np.load('/work/sm222/data/physionet.org/files/echonext/1.1.1/EchoNext_val_waveforms.npy')
-    ECG_test_raw  = np.load('/work/sm222/data/physionet.org/files/echonext/1.1.1/EchoNext_test_waveforms.npy')
-    Echo_data     = pd.read_csv('/work/sm222/data/physionet.org/files/echonext/1.1.1/echonext_metadata_100k.csv')
+    ECG_train_raw = np.load('../EchoNextData/EchoNext_train_waveforms.npy')
+    ECG_val_raw   = np.load('../EchoNextData/EchoNext_val_waveforms.npy')
+    ECG_test_raw  = np.load('../EchoNextData/EchoNext_test_waveforms.npy')
+    Echo_data     = pd.read_csv('../EchoNextData/echonext_metadata_100k.csv')
 
     # ── STEP B: WAVEFORM PRE-FILTERING ──────────────────────────────
     X_train_lead1 = ECG_train_raw[:, 0, :, :]
