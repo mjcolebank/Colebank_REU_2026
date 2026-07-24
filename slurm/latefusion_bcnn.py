@@ -155,7 +155,7 @@ class BayesianDemographicMLP(nn.Module):
             prior_sigma_1=PRIOR_SIGMA_1, prior_sigma_2=PRIOR_SIGMA_2, prior_pi=PRIOR_PI,
             posterior_rho_init=POSTERIOR_RHO_INIT
         )
-        self.relu = nn.ReLU()
+        self.gelu = nn.GeLU()
         self.fc2 = BayesianLinear(
             32, output_dim,
             prior_sigma_1=PRIOR_SIGMA_1, prior_sigma_2=PRIOR_SIGMA_2, prior_pi=PRIOR_PI,
@@ -163,8 +163,8 @@ class BayesianDemographicMLP(nn.Module):
         )
 
     def forward(self, x):
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
+        x = self.gelu(self.fc1(x))
+        x = self.gelu(self.fc2(x))
         return x
 
 @variational_estimator
@@ -195,7 +195,7 @@ class BayesianLateFusionHeartDiseaseModel(nn.Module):
         self.conv3 = bconv(32, 32, 5, 2)
         self.gap   = nn.AdaptiveAvgPool1d(1)        # 25 -> 1
 
-        self.relu = nn.ReLU()
+        self.gelu = nn.GeLU()
 
         self.demog_features = BayesianDemographicMLP(input_dim=demog_dim, output_dim=16)
 
@@ -203,20 +203,20 @@ class BayesianLateFusionHeartDiseaseModel(nn.Module):
         self.fc_out2 = blinear(32, num_classes)
 
     def forward(self, ts_input, demog_input):
-        x = self.relu(self.conv1(ts_input))
+        x = self.gelu(self.conv1(ts_input))
         x = self.pool1(x)
 
-        x = self.relu(self.conv2(x))
+        x = self.gelu(self.conv2(x))
         x = self.pool2(x)
 
-        x = self.relu(self.conv3(x))
+        x = self.gelu(self.conv3(x))
         x = self.gap(x)
         ts_emb = torch.flatten(x, start_dim=1)          # [B, 32]
 
         demog_emb = self.demog_features(demog_input)    # [B, 16]
 
         fused = torch.cat((ts_emb, demog_emb), dim=1)   # [B, 48]
-        out = self.relu(self.fc_out1(fused))
+        out = self.gelu(self.fc_out1(fused))
         out = self.fc_out2(out)
         return out
 
