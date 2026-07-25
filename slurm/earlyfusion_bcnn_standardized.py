@@ -29,9 +29,9 @@ torch.manual_seed(RANDOM_SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}" , flush = True)
 
-PRIOR_SIGMA_1 = 2.0
+PRIOR_SIGMA_1 = 1.0
 PRIOR_SIGMA_2 = 0.0025
-PRIOR_PI = 1.0
+PRIOR_PI = 0.5
 POSTERIOR_RHO_INIT = -5.0
 
 CATEGORICAL_COLS = ["race_ethnicity", "sex"]
@@ -53,7 +53,8 @@ def bandpass_filter_ecg(signal_array, fs=ECG_SAMPLING_RATE_HZ,
                          low=FILTER_LOW_HZ, high=FILTER_HIGH_HZ, order=FILTER_ORDER):
     nyquist = 0.5 * fs
     b, a = butter(order, [low / nyquist, high / nyquist], btype="band")
-    filtered = filtfilt(b, a, signal_array, axis=0)
+    # signal_array shape: (leads, time) — filter along time axis, leads handled independently
+    filtered = filtfilt(b, a, signal_array, axis=-1)
     return filtered.astype(np.float32)
 
 # ──────────────────────────────────────────────────────────────────────
@@ -155,7 +156,7 @@ class BayesianFiLMConvBlock(nn.Module):
         )
         self.bn = nn.BatchNorm1d(out_channels)
         self.film = BayesianFiLMLayer(demo_embed_dim, out_channels)
-        self.act = nn.GeLU()
+        self.act = nn.ReLU()
         self.pool = nn.AdaptiveAvgPool1d(1) if pool_type == "gap" else nn.AvgPool1d(kernel_size=pool_size)
 
     def forward(self, x, demo_embed):
@@ -171,7 +172,7 @@ class BayesianHeartDiseaseNet(nn.Module):
                 prior_pi=PRIOR_PI, posterior_rho_init=POSTERIOR_RHO_INIT
             )
 
-        self.demo_encoder = nn.Sequential(blinear(demo_dim, demo_embed_dim), nn.GeLU())
+        self.demo_encoder = nn.Sequential(blinear(demo_dim, demo_embed_dim), nn.ReLU())
         self.block1 = BayesianFiLMConvBlock(in_channels, 16, kernel_size=15, padding=7, pool_size=10, demo_embed_dim=demo_embed_dim, pool_type="avg")
         self.block2 = BayesianFiLMConvBlock(16, 32, kernel_size=9, padding=4, pool_size=10, demo_embed_dim=demo_embed_dim, pool_type="avg")
         self.block3 = BayesianFiLMConvBlock(32, 32, kernel_size=5, padding=2, pool_size=None, demo_embed_dim=demo_embed_dim, pool_type="gap")
@@ -182,7 +183,7 @@ class BayesianHeartDiseaseNet(nn.Module):
             x = self.block3(self.block2(self.block1(dummy_ts, dummy_demo), dummy_demo), dummy_demo)
             flat_sz = x.shape[1] * x.shape[2]
 
-        self.head = nn.Sequential(nn.Flatten(), blinear(flat_sz, 32), nn.GeLU(), blinear(32, num_classes))
+        self.head = nn.Sequential(nn.Flatten(), blinear(flat_sz, 32), nn.ReLU(), blinear(32, num_classes))
 
     def forward(self, x_ts, x_demo):
         demo_embed = self.demo_encoder(x_demo)
@@ -220,9 +221,13 @@ def train_bayesian_classifier(model, train_loader, val_loader, epochs=60, learni
             for X_ts_v, X_demo_v, y_v in val_loader:
                 X_ts_v, X_demo_v, y_v = X_ts_v.to(device), X_demo_v.to(device), y_v.to(device)
 
-                # FIX: Average raw logits directly before computing CrossEntropy
-                logits_accum = torch.stack([model(X_ts_v, X_demo_v) for _ in range(10)], dim=0).mean(dim=0)
-                val_loss += criterion(logits_accum, y_v).item() * X_ts_v.shape[0]
+                # Correct MC predictive: average probabilities, not logits
+                pass_logits = torch.stack([model(X_ts_v, X_demo_v) for _ in range(10)], dim=0)
+                pass_log_probs = torch.log_softmax(pass_logits, dim=-1)
+                log_mean_probs = torch.logsumexp(pass_log_probs, dim=0) - np.log(10)
+
+                batch_loss = nn.functional.nll_loss(log_mean_probs, y_v, reduction='sum')
+                val_loss += batch_loss.item()
                 val_total += X_ts_v.shape[0]
 
         epoch_val_loss = val_loss / val_total
@@ -249,21 +254,23 @@ def get_predictions_and_labels(model, loader, sample_nbr=50):
     model.eval()
     all_probs, all_labels = [], []
     all_nll = 0.0
-    criterion = nn.CrossEntropyLoss(reduction='sum')
 
     with torch.no_grad():
         for X_ts_b, X_demo_b, y_b in loader:
-            X_ts_b, X_demo_b = X_ts_b.to(device), X_demo_b.to(device)
-            pass_logits = torch.stack([model(X_ts_b, X_demo_b) for _ in range(sample_nbr)], dim=0)
+            X_ts_b, X_demo_b, y_b = X_ts_b.to(device), X_demo_b.to(device), y_b.to(device)
+            pass_logits = torch.stack([model(X_ts_b, X_demo_b) for _ in range(sample_nbr)], dim=0)  # (S, B, C)
 
-            # FIX: Average the raw logits across samples first
-            mean_logits = pass_logits.mean(dim=0)
-            all_nll += criterion(mean_logits, y_b.to(device)).item()
+            # Correct MC predictive: average PROBABILITIES across samples, not logits.
+            # Use logsumexp for numerical stability instead of mean(softmax(.)).log()
+            pass_log_probs = torch.log_softmax(pass_logits, dim=-1)                       # (S, B, C)
+            log_mean_probs = torch.logsumexp(pass_log_probs, dim=0) - np.log(sample_nbr)  # (B, C)
+            mean_probs = log_mean_probs.exp()
 
-            # Pass averaged logits to softmax for metric evaluation
-            mean_probs = torch.softmax(mean_logits, dim=-1)
+            nll_batch = nn.functional.nll_loss(log_mean_probs, y_b, reduction='sum')
+            all_nll += nll_batch.item()
+
             all_probs.extend(mean_probs[:, 1].cpu().numpy())
-            all_labels.extend(y_b.numpy())
+            all_labels.extend(y_b.cpu().numpy())
 
     return np.array(all_probs), np.array(all_labels), all_nll / len(loader.dataset)
 
@@ -340,18 +347,11 @@ if __name__ == "__main__":
     ECG_test_raw  = np.load('/work/sm222/data/physionet.org/files/echonext/1.1.1/EchoNext_test_waveforms.npy')
     Echo_data     = pd.read_csv('/work/sm222/data/physionet.org/files/echonext/1.1.1/echonext_metadata_100k.csv')
 
-    # ── STEP B: WAVEFORM PRE-FILTERING ──────────────────────────────
-    X_train_lead1 = ECG_train_raw[:, 0, :, :]
-    X_val_lead1   = ECG_val_raw[:, 0, :, :]
-    X_test_lead1  = ECG_test_raw[:, 0, :, :]
-
-    X_filt_train = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in X_train_lead1])
-    X_filt_val   = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in X_val_lead1])
-    X_filt_test  = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in X_test_lead1])
-
-    X_ts_train = np.swapaxes(X_filt_train, 1, 2)
-    X_ts_val   = np.swapaxes(X_filt_val, 1, 2)
-    X_ts_test  = np.swapaxes(X_filt_test, 1, 2)
+    # ── STEP B: WAVEFORM PRE-FILTERING (all 12 leads) ────────────────
+    # ECG_*_raw shape: (N, 12, T) — already channel-first, no swapaxes needed
+    X_ts_train = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in ECG_train_raw])
+    X_ts_val   = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in ECG_val_raw])
+    X_ts_test  = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in ECG_test_raw])
 
     # ── STEP C: EXTRACTION FROM EXPLICIT SPLITS ───────────────────────
     train_ids = Echo_data.index[Echo_data['split'] == 'train'].tolist()
