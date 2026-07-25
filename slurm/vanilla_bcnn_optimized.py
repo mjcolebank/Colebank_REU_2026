@@ -56,10 +56,10 @@ def bandpass_filter_ecg(signal_array, fs=ECG_SAMPLING_RATE_HZ,
                          low=FILTER_LOW_HZ, high=FILTER_HIGH_HZ, order=FILTER_ORDER):
     nyquist = 0.5 * fs
     b, a = butter(order, [low / nyquist, high / nyquist], btype="band")
-    # signal_array shape: (leads, time) — filter along time axis, leads handled independently
-    filtered = filtfilt(b, a, signal_array, axis=-1)
+    # signal_array shape: (time, leads) — filter along time axis (axis=0), leads handled independently
+    filtered = filtfilt(b, a, signal_array, axis=0)
     return filtered.astype(np.float32)
-
+                             
 # ──────────────────────────────────────────────────────────────────────
 # 2. DATA INGESTION & TENSOR CONVERSION (100K PIPELINE INTEGRATION)
 # ──────────────────────────────────────────────────────────────────────
