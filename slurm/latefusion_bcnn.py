@@ -156,7 +156,7 @@ class BayesianDemographicMLP(nn.Module):
             prior_sigma_1=PRIOR_SIGMA_1, prior_sigma_2=PRIOR_SIGMA_2, prior_pi=PRIOR_PI,
             posterior_rho_init=POSTERIOR_RHO_INIT
         )
-        self.gelu = nn.GeLU()
+        self.gelu = nn.GELU()
         self.fc2 = BayesianLinear(
             32, output_dim,
             prior_sigma_1=PRIOR_SIGMA_1, prior_sigma_2=PRIOR_SIGMA_2, prior_pi=PRIOR_PI,
@@ -196,7 +196,7 @@ class BayesianLateFusionHeartDiseaseModel(nn.Module):
         self.conv3 = bconv(32, 32, 5, 2)
         self.gap   = nn.AdaptiveAvgPool1d(1)        # 25 -> 1
 
-        self.gelu = nn.GeLU()
+        self.gelu = nn.GELU()
 
         self.demog_features = BayesianDemographicMLP(input_dim=demog_dim, output_dim=16)
 
