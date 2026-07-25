@@ -59,9 +59,9 @@ FILTER_HIGH_HZ = 40.0
 FILTER_ORDER = 4
 
 # Bayesian priors scale-mixture settings
-PRIOR_SIGMA_1 = 2.0
+PRIOR_SIGMA_1 = 1.0
 PRIOR_SIGMA_2 = 0.0025
-PRIOR_PI = 1.0
+PRIOR_PI = 0.5
 POSTERIOR_RHO_INIT = -5.0
 
 # ──────────────────────────────────────────────────────────────────────
@@ -71,7 +71,8 @@ def bandpass_filter_ecg(signal_array, fs=ECG_SAMPLING_RATE_HZ,
                          low=FILTER_LOW_HZ, high=FILTER_HIGH_HZ, order=FILTER_ORDER):
     nyquist = 0.5 * fs
     b, a = butter(order, [low / nyquist, high / nyquist], btype="band")
-    filtered = filtfilt(b, a, signal_array, axis=0)
+    # signal_array shape: (leads, time) — filter along time axis, leads handled independently
+    filtered = filtfilt(b, a, signal_array, axis=-1)
     return filtered.astype(np.float32)
 
 def preprocess_demographics_pipeline(
@@ -258,14 +259,12 @@ def train_bayesian_classifier(model, train_loader, val_loader, epochs=60, learni
         with torch.no_grad():
             for X_ts_v, X_demo_v, y_v in val_loader:
                 X_ts_v, X_demo_v, y_v = X_ts_v.to(device), X_demo_v.to(device), y_v.to(device)
-
                 probs_accum = 0.0
                 for _ in range(sample_nbr):
                     logits_v = model(X_ts_v, X_demo_v)
                     probs_accum += torch.softmax(logits_v, dim=-1)
                 probs_mean = probs_accum / sample_nbr
-
-                val_loss += criterion(torch.log(probs_mean + 1e-8), y_v).item() * X_ts_v.shape[0]
+                val_loss += nn.functional.nll_loss(torch.log(probs_mean + 1e-8), y_v, reduction='sum').item()
                 val_total += X_ts_v.shape[0]
 
         epoch_val_loss = val_loss / val_total
@@ -315,7 +314,7 @@ def get_predictions_and_labels(model, loader, mc_samples=30):
 
             eps = 1e-8
             log_mean_prob = torch.log(torch.tensor(mean_prob) + eps).to(device)
-            all_nll += criterion(log_mean_prob, y_b.to(device)).item()
+            all_nll += nn.functional.nll_loss(log_mean_prob, y_b.to(device), reduction='sum').item()
 
             all_probs.extend(mean_prob[:, 1])
             all_stds.extend(std_prob)
@@ -397,18 +396,11 @@ if __name__ == "__main__":
     ECG_test_raw  = np.load('/work/sm222/data/physionet.org/files/echonext/1.1.1/EchoNext_test_waveforms.npy')
     Echo_data     = pd.read_csv('/work/sm222/data/physionet.org/files/echonext/1.1.1/echonext_metadata_100k.csv')
 
-    # ── STEP B: WAVEFORM PRE-FILTERING ──────────────────────────────
-    X_train_lead1 = ECG_train_raw[:, 0, :, :]
-    X_val_lead1   = ECG_val_raw[:, 0, :, :]
-    X_test_lead1  = ECG_test_raw[:, 0, :, :]
-
-    X_filt_train = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in X_train_lead1])
-    X_filt_val   = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in X_val_lead1])
-    X_filt_test  = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in X_test_lead1])
-
-    X_ts_train = np.swapaxes(X_filt_train, 1, 2)
-    X_ts_val   = np.swapaxes(X_filt_val, 1, 2)
-    X_ts_test  = np.swapaxes(X_filt_test, 1, 2)
+    # ── STEP B: WAVEFORM PRE-FILTERING (all 12 leads) ────────────────
+    # ECG_*_raw shape: (N, 12, T) — already channel-first, no swapaxes needed
+    X_ts_train = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in ECG_train_raw])
+    X_ts_val   = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in ECG_val_raw])
+    X_ts_test  = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in ECG_test_raw])
 
     # ── STEP C: EXTRACTION FROM EXPLICIT SPLITS ───────────────────────
     train_ids = Echo_data.index[Echo_data['split'] == 'train'].tolist()
