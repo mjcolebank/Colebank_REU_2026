@@ -156,7 +156,7 @@ class BayesianFiLMConvBlock(nn.Module):
         )
         self.bn = nn.BatchNorm1d(out_channels)
         self.film = BayesianFiLMLayer(demo_embed_dim, out_channels)
-        self.act = nn.ReLU()
+        self.act = nn.GELU()
         self.pool = nn.AdaptiveAvgPool1d(1) if pool_type == "gap" else nn.AvgPool1d(kernel_size=pool_size)
 
     def forward(self, x, demo_embed):
@@ -172,7 +172,7 @@ class BayesianHeartDiseaseNet(nn.Module):
                 prior_pi=PRIOR_PI, posterior_rho_init=POSTERIOR_RHO_INIT
             )
 
-        self.demo_encoder = nn.Sequential(blinear(demo_dim, demo_embed_dim), nn.ReLU())
+        self.demo_encoder = nn.Sequential(blinear(demo_dim, demo_embed_dim), nn.GELU())
         self.block1 = BayesianFiLMConvBlock(in_channels, 16, kernel_size=15, padding=7, pool_size=10, demo_embed_dim=demo_embed_dim, pool_type="avg")
         self.block2 = BayesianFiLMConvBlock(16, 32, kernel_size=9, padding=4, pool_size=10, demo_embed_dim=demo_embed_dim, pool_type="avg")
         self.block3 = BayesianFiLMConvBlock(32, 32, kernel_size=5, padding=2, pool_size=None, demo_embed_dim=demo_embed_dim, pool_type="gap")
@@ -183,7 +183,7 @@ class BayesianHeartDiseaseNet(nn.Module):
             x = self.block3(self.block2(self.block1(dummy_ts, dummy_demo), dummy_demo), dummy_demo)
             flat_sz = x.shape[1] * x.shape[2]
 
-        self.head = nn.Sequential(nn.Flatten(), blinear(flat_sz, 32), nn.ReLU(), blinear(32, num_classes))
+        self.head = nn.Sequential(nn.Flatten(), blinear(flat_sz, 32), nn.GELU(), blinear(32, num_classes))
 
     def forward(self, x_ts, x_demo):
         demo_embed = self.demo_encoder(x_demo)
