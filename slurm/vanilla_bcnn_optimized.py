@@ -79,15 +79,18 @@ y_train = np.array(Echo_data['shd_moderate_or_greater_flag'][train_ids])
 y_val   = np.array(Echo_data['shd_moderate_or_greater_flag'][val_ids])
 y_test  = np.array(Echo_data['shd_moderate_or_greater_flag'][test_ids])
 
-#may need to change if there are errors 
-X_ts_train = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in ECG_train_raw])
-X_ts_val   = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in ECG_val_raw])
-X_ts_test  = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in ECG_test_raw])
+# ── STEP B: WAVEFORM PRE-FILTERING ──────────────────────────────
+X_train_lead1 = ECG_train_raw[:, 0, :, :]
+X_val_lead1   = ECG_val_raw[:, 0, :, :]
+X_test_lead1  = ECG_test_raw[:, 0, :, :]
 
-# Convert shapes to format: [N, channels, sequence_length] - may need to change if orders are wrong 
-X_ts_train = np.swapaxes(X_ts_train, 1, 2)
-X_ts_val   = np.swapaxes(X_ts_val, 1, 2)
-X_ts_test  = np.swapaxes(X_ts_test, 1, 2)
+X_filt_train = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in X_train_lead1])
+X_filt_val   = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in X_val_lead1])
+X_filt_test  = np.array([bandpass_filter_ecg(x, fs=ECG_SAMPLING_RATE_HZ) for x in X_test_lead1])
+
+X_ts_train = np.swapaxes(X_filt_train, 1, 2)
+X_ts_val   = np.swapaxes(X_filt_val, 1, 2)
+X_ts_test  = np.swapaxes(X_filt_test, 1, 2)
 
 print(f"Split sizes -> train: {len(train_ids)}, val: {len(val_ids)}, test: {len(test_ids)}", flush = True)
 
