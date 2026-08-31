@@ -1,3 +1,0 @@
-run_index,kernel_size,prior_size,activation_function,num_filters,lr,num_epochs,num_prediction_samples,test_accuracy,final_avg_negative_elbo_per_example,elapsed_seconds,status,error
-108,5,1.0,tanh(),8,0.001,50,10,0.6023,6134.0097854071855,22.571,ok,
-228,7,0.75,tanh(),64,0.001,50,10,0.6015999999999999,4644.407550966143,69.355,ok,
