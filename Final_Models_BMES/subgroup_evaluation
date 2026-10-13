@@ -1,0 +1,995 @@
+#!/usr/bin/env python
+"""
+Subgroup (age x race/ethnicity) evaluation of the four EchoNext SHD models.
+
+Models supported (pass any subset; omitted ones are skipped):
+    --early-bayes  PATH   Pyro early-fusion (FiLM) Bayesian CNN   (earlyfusion_pyro_checkpoint.pt)
+    --late-bayes   PATH   Pyro late-fusion Bayesian CNN           (latefusion_pyro_checkpoint.pt)
+    --early-cnn    PATH   Deterministic early-fusion (FiLM) CNN   (state_dict or checkpoint dict)
+    --late-cnn     PATH   Deterministic late-fusion CNN           (state_dict or checkpoint dict)
+
+For every model the script reports, for the chosen split (default: test), overall and for
+every age group, race/ethnicity group and age x race/ethnicity intersection cell:
+    n, SHD prevalence, accuracy (+95% Wilson CI), sensitivity, specificity, AUROC
+
+For the two Bayesian models it additionally splits each group into INCONCLUSIVE vs CONCLUSIVE
+ECGs, using the same rule as find_inconclusive_patients.py (95% interval of the posterior draws
+straddles the threshold AND >= 20% of draws lie on the other side) and reports the share of
+inconclusive ECGs and the accuracy within each part, plus the ECGs that are inconclusive under
+BOTH Bayesian models. (The deterministic CNNs have no posterior, so this is not defined for them.)
+Outputs: long/wide CSVs, age x race matrices and a Markdown report.
+
+Example
+-------
+python subgroup_evaluation.py \
+    --data-dir ../EchoNextData \
+    --early-bayes earlyfusion_pyro_results/earlyfusion_pyro_checkpoint.pt \
+    --late-bayes  latefusion_pyro_results/latefusion_pyro_checkpoint.pt \
+    --early-cnn   earlyfusion_cnn.pt \
+    --late-cnn    latefusion_cnn.pt \
+    --out-dir subgroup_results      # add --threshold 0.5 --minority-frac 0.2 --mc-samples 200 (defaults)
+
+SECURITY NOTE: checkpoints are loaded with torch.load(weights_only=False) because the
+Pyro checkpoints contain sklearn objects / pandas indices. Only load files you created.
+"""
+
+import argparse
+import glob
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt
+from sklearn.impute import KNNImputer
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import constraints
+
+import pyro
+import pyro.distributions as dist
+import pyro.poutine as poutine
+from pyro.infer.autoguide import AutoNormal
+from pyro.nn import PyroModule, PyroSample
+
+# ──────────────────────────────────────────────────────────────────────
+# 0. CONSTANTS (must match the training scripts)
+# ──────────────────────────────────────────────────────────────────────
+CATEGORICAL_COLS = ["race_ethnicity", "sex"]
+CONTINUOUS_COLS = [
+    "age_at_ecg", "ventricular_rate", "atrial_rate",
+    "pr_interval", "qrs_duration", "qt_corrected",
+]
+ALL_DEMO_COLS = CATEGORICAL_COLS + CONTINUOUS_COLS
+
+ECG_SAMPLING_RATE_HZ = 250
+FILTER_LOW_HZ, FILTER_HIGH_HZ, FILTER_ORDER = 0.5, 40.0, 4
+
+POSTERIOR_RHO_INIT = -6.0  # only used to build the guide; values are overwritten on load
+
+# Age groups. Ages are capped at 90 in the dataset, so ">90" in the reference table is
+# really "90+" (age == 90). Lower edge is inclusive, upper edge exclusive.
+AGE_BINS = [0, 18, 30, 40, 50, 60, 70, 80, 90, np.inf]
+AGE_LABELS = ["<18", "18-29", "30-39", "40-49", "50-59", "60-69", "70-79", "80-89", "90+"]
+RACE_ORDER = ["Hispanic", "White", "Black", "Asian", "Other", "Unknown"]
+
+# Reference distribution supplied with the task (% of the full dataset)
+REF_AGE_PCT = {"18-29": 4.72, "30-39": 6.72, "40-49": 10.90, "50-59": 18.92,
+               "60-69": 25.98, "70-79": 20.19, "80-89": 10.51, "90+": 2.06}
+REF_RACE_PCT = {"Hispanic": 31.01, "White": 29.21, "Black": 16.46,
+                "Asian": 3.43, "Other": 7.43, "Unknown": 12.46}
+
+# name -> (CLI flag attribute, display name, kind, default KNN k used in training)
+MODEL_REGISTRY = {
+    "early_bayes": ("early_bayes", "Early-fusion Bayesian", "early_bayes", 5),
+    "late_bayes": ("late_bayes", "Late-fusion Bayesian", "late_bayes", 5),
+    "early_cnn": ("early_cnn", "Early-fusion CNN", "early_cnn", 5),
+    "late_cnn": ("late_cnn", "Late-fusion CNN", "late_cnn", 3),
+}
+
+# Prior hyper-parameters are read from the checkpoint before the model is built
+# (they only matter for the ELBO and for creating the guide; inference uses the
+# learned posterior).
+PRIOR = {"sigma_1": 3.0, "sigma_2": 0.1, "pi": 1.0}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 1. DATA: WAVEFORMS + DEMOGRAPHICS (identical processing to training)
+# ──────────────────────────────────────────────────────────────────────
+def load_filtered_waveforms(path, chunk=512):
+    """(N,1,2500,12) .npy -> band-pass filtered float32 array of shape (N,12,2500)."""
+    raw = np.load(path, mmap_mode="r")
+    n, _, t, leads = raw.shape
+    nyq = 0.5 * ECG_SAMPLING_RATE_HZ
+    b, a = butter(FILTER_ORDER, [FILTER_LOW_HZ / nyq, FILTER_HIGH_HZ / nyq], btype="band")
+    out = np.empty((n, leads, t), dtype=np.float32)
+    for s in range(0, n, chunk):
+        block = np.asarray(raw[s:s + chunk, 0])             # (n,2500,12)
+        filt = filtfilt(b, a, block, axis=1)                 # filter along time, per lead
+        out[s:s + chunk] = np.swapaxes(filt, 1, 2).astype(np.float32)
+    return out
+
+
+def _imputer_input(df, categories):
+    codes = pd.DataFrame(index=df.index)
+    for col in CATEGORICAL_COLS:
+        codes[col] = pd.Categorical(df[col], categories=categories[col]).codes
+    codes = codes.where(codes >= 0)  # unseen / missing category -> NaN (to be imputed)
+    return pd.concat([codes, df[CONTINUOUS_COLS].astype(float)], axis=1)
+
+
+def _impute_and_encode(df, categories, imputer, feature_names=None):
+    df = df[ALL_DEMO_COLS]
+    imputed = pd.DataFrame(imputer.transform(_imputer_input(df, categories)),
+                           columns=ALL_DEMO_COLS, index=df.index)
+    for col in CATEGORICAL_COLS:
+        cats = categories[col]
+        codes = imputed[col].round().astype(int).clip(0, len(cats) - 1)
+        imputed[col] = pd.Categorical.from_codes(codes, categories=cats)
+    ohe = pd.get_dummies(imputed, columns=CATEGORICAL_COLS, dtype=float)
+    if feature_names is not None:
+        ohe = ohe.reindex(columns=feature_names, fill_value=0)
+    return ohe
+
+
+def fit_demographic_preprocessor(train_df, knn_k):
+    """Re-create the training-time imputer/scaler from the TRAIN split metadata."""
+    df = train_df[ALL_DEMO_COLS]
+    categories = {c: df[c].astype("category").cat.categories for c in CATEGORICAL_COLS}
+    imputer = KNNImputer(n_neighbors=knn_k).fit(_imputer_input(df, categories))
+    ohe = _impute_and_encode(df, categories, imputer)
+    feature_names = list(ohe.columns)
+    scaler = StandardScaler().fit(ohe[CONTINUOUS_COLS].to_numpy(dtype=np.float32))
+    return {"scaler": scaler, "imputer": imputer, "categories": categories,
+            "feature_names": feature_names}
+
+
+def transform_demographics(df, prep):
+    ohe = _impute_and_encode(df, prep["categories"], prep["imputer"], prep["feature_names"])
+    arr = ohe.to_numpy(dtype=np.float32)
+    idx = [prep["feature_names"].index(c) for c in CONTINUOUS_COLS]
+    arr[:, idx] = prep["scaler"].transform(arr[:, idx])
+    return arr
+
+
+def extract_prep_from_checkpoint(ckpt):
+    keys = ("demographic_scaler", "demographic_imputer", "demographic_categories", "feature_names")
+    if isinstance(ckpt, dict) and all(k in ckpt for k in keys):
+        return {"scaler": ckpt["demographic_scaler"], "imputer": ckpt["demographic_imputer"],
+                "categories": ckpt["demographic_categories"], "feature_names": ckpt["feature_names"]}
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 2. DETERMINISTIC ARCHITECTURES (copied from the training scripts)
+# ──────────────────────────────────────────────────────────────────────
+class DemographicMLP(nn.Module):
+    def __init__(self, input_dim, output_dim=16):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, 32), nn.BatchNorm1d(32), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(32, output_dim), nn.BatchNorm1d(output_dim), nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class LateFusionHeartDiseaseModel(nn.Module):
+    def __init__(self, sequence_length=2500, num_classes=2, in_channels=12, demog_dim=8, demo_embed_dim=16):
+        super().__init__()
+        self.ts_features = nn.Sequential(
+            nn.Conv1d(in_channels, 16, kernel_size=7, padding=3), nn.BatchNorm1d(16), nn.ReLU(), nn.Dropout(0.5),
+            nn.AdaptiveAvgPool1d(250),
+            nn.Conv1d(16, 32, kernel_size=5, padding=2), nn.BatchNorm1d(32), nn.ReLU(), nn.Dropout(0.6),
+            nn.AdaptiveAvgPool1d(25),
+            nn.Conv1d(32, 32, kernel_size=3, padding=1), nn.BatchNorm1d(32), nn.ReLU(), nn.Dropout(0.8),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.demog_features = DemographicMLP(input_dim=demog_dim, output_dim=demo_embed_dim)
+        self.classifier = nn.Sequential(nn.Flatten(), nn.Linear(32 + demo_embed_dim, num_classes))
+
+    def forward(self, ts_input, demog_input):
+        ts_emb = torch.flatten(self.ts_features(ts_input), start_dim=1)
+        demog_emb = self.demog_features(demog_input)
+        return self.classifier(torch.cat((ts_emb, demog_emb), dim=1))
+
+
+class FiLMLayer(nn.Module):
+    def __init__(self, demo_embed_dim, num_channels):
+        super().__init__()
+        self.film_proj = nn.Linear(demo_embed_dim, 2 * num_channels)
+
+    def forward(self, h, demo_embed):
+        gamma, beta = self.film_proj(demo_embed).chunk(2, dim=-1)
+        return gamma.unsqueeze(-1) * h + beta.unsqueeze(-1)
+
+
+class HeartDiseaseModel(nn.Module):  # early-fusion (FiLM) CNN
+    def __init__(self, sequence_length=2500, num_classes=2, in_channels=12, demog_dim=8, demo_embed_dim=16):
+        super().__init__()
+        self.demog_features = nn.Sequential(
+            nn.Linear(demog_dim, 32), nn.BatchNorm1d(32), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(32, demo_embed_dim), nn.BatchNorm1d(demo_embed_dim), nn.ReLU(),
+        )
+        self.conv1 = nn.Conv1d(in_channels, 16, kernel_size=7, padding=3)
+        self.bn1 = nn.BatchNorm1d(16)
+        self.film1 = FiLMLayer(demo_embed_dim, 16)
+        self.act1 = nn.ReLU()
+        self.drop1 = nn.Dropout(0.5)
+        self.pool1 = nn.AdaptiveAvgPool1d(250)
+
+        self.conv2 = nn.Conv1d(16, 32, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.film2 = FiLMLayer(demo_embed_dim, 32)
+        self.act2 = nn.ReLU()
+        self.drop2 = nn.Dropout(0.6)
+        self.pool2 = nn.AdaptiveAvgPool1d(25)
+
+        self.conv3 = nn.Conv1d(32, 32, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(32)
+        self.film3 = FiLMLayer(demo_embed_dim, 32)
+        self.act3 = nn.ReLU()
+        self.drop3 = nn.Dropout(0.8)
+        self.pool3 = nn.AdaptiveAvgPool1d(1)
+
+        self.classifier = nn.Sequential(nn.Flatten(), nn.Linear(32, num_classes))
+
+    def forward(self, ts_input, demog_input):
+        e = self.demog_features(demog_input)
+        x = self.pool1(self.drop1(self.act1(self.film1(self.bn1(self.conv1(ts_input)), e))))
+        x = self.pool2(self.drop2(self.act2(self.film2(self.bn2(self.conv2(x)), e))))
+        x = self.pool3(self.drop3(self.act3(self.film3(self.bn3(self.conv3(x)), e))))
+        return self.classifier(x)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 3. PYRO BAYESIAN ARCHITECTURES (copied from the training scripts)
+#    Module/attribute names determine the Pyro parameter names, so they
+#    must NOT be renamed or the saved posterior will not load.
+# ──────────────────────────────────────────────────────────────────────
+class RealSupportMixtureSameFamily(dist.MixtureSameFamily):
+    support = constraints.real
+
+
+class _ScaleMixturePriorMixin:
+    def _register_prior_buffers(self):
+        self.register_buffer("_prior_probs",
+                             torch.tensor([PRIOR["pi"], 1.0 - PRIOR["pi"]], dtype=torch.float32))
+        self.register_buffer("_prior_locs", torch.zeros(2, dtype=torch.float32))
+        self.register_buffer("_prior_scales",
+                             torch.tensor([PRIOR["sigma_1"], PRIOR["sigma_2"]], dtype=torch.float32))
+
+    def _prior(self, shape):
+        mixture = RealSupportMixtureSameFamily(
+            dist.Categorical(probs=self._prior_probs),
+            dist.Normal(self._prior_locs, self._prior_scales),
+        )
+        return mixture.expand(shape).to_event(len(shape))
+
+
+class PyroBayesianLinear(_ScaleMixturePriorMixin, PyroModule):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self._register_prior_buffers()
+        self.weight = PyroSample(lambda m: m._prior((out_features, in_features)))
+        self.bias = PyroSample(lambda m: m._prior((out_features,))) if bias else None
+
+    def forward(self, x):
+        return F.linear(x, self.weight, self.bias)
+
+
+class PyroBayesianConv1d(_ScaleMixturePriorMixin, PyroModule):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True):
+        super().__init__()
+        self.stride, self.padding = stride, padding
+        self._register_prior_buffers()
+        self.weight = PyroSample(lambda m: m._prior((out_channels, in_channels, kernel_size)))
+        self.bias = PyroSample(lambda m: m._prior((out_channels,))) if bias else None
+
+    def forward(self, x):
+        return F.conv1d(x, self.weight, self.bias, stride=self.stride, padding=self.padding)
+
+
+# ---- early-fusion Bayesian (FiLM) ----
+class BayesianFiLMLayer(PyroModule):
+    def __init__(self, demo_embed_dim, num_channels):
+        super().__init__()
+        self.film_proj = PyroBayesianLinear(demo_embed_dim, 2 * num_channels)
+
+    def forward(self, h, demo_embed):
+        gamma, beta = self.film_proj(demo_embed).chunk(2, dim=-1)
+        return gamma.unsqueeze(-1) * h + beta.unsqueeze(-1)
+
+
+class BayesianFiLMConvBlock(PyroModule):
+    def __init__(self, in_channels, out_channels, kernel_size, padding, pool_size,
+                 demo_embed_dim, pool_type="avg"):
+        super().__init__()
+        self.conv = PyroBayesianConv1d(in_channels, out_channels, kernel_size=kernel_size, padding=padding)
+        self.bn = nn.BatchNorm1d(out_channels)
+        self.film = BayesianFiLMLayer(demo_embed_dim, out_channels)
+        self.act = nn.GELU()
+        self.pool = nn.AdaptiveAvgPool1d(1) if pool_type == "gap" else nn.AvgPool1d(kernel_size=pool_size)
+
+    def forward(self, x, demo_embed):
+        x = self.bn(self.conv(x))
+        x = self.act(self.film(x, demo_embed))
+        return self.pool(x)
+
+
+class BayesianHeartDiseaseNet(PyroModule):
+    def __init__(self, sequence_length, in_channels, demo_dim, num_classes=2, demo_embed_dim=16):
+        super().__init__()
+        self.sequence_length = sequence_length
+        self.in_channels = in_channels
+        self.demo_dim = demo_dim
+        self.num_classes = num_classes
+        self.demo_embed_dim = demo_embed_dim
+
+        self.demo_linear = PyroBayesianLinear(demo_dim, demo_embed_dim)
+        self.demo_activation = nn.GELU()
+        self.block1 = BayesianFiLMConvBlock(in_channels, 16, 15, 7, 10, demo_embed_dim, "avg")
+        self.block2 = BayesianFiLMConvBlock(16, 32, 9, 4, 10, demo_embed_dim, "avg")
+        self.block3 = BayesianFiLMConvBlock(32, 32, 5, 2, None, demo_embed_dim, "gap")
+        self.head_linear1 = PyroBayesianLinear(32, 32)
+        self.head_activation = nn.GELU()
+        self.head_linear2 = PyroBayesianLinear(32, num_classes)
+
+    def forward(self, x_ts, x_demo):
+        demo_embed = self.demo_activation(self.demo_linear(x_demo))
+        x = self.block1(x_ts, demo_embed)
+        x = self.block2(x, demo_embed)
+        x = self.block3(x, demo_embed)
+        x = torch.flatten(x, start_dim=1)
+        x = self.head_activation(self.head_linear1(x))
+        return self.head_linear2(x)
+
+
+class PyroHeartDiseaseClassifier(PyroModule):
+    """Wrapper kept so that parameter names ('network.*') match the checkpoint."""
+    def __init__(self, network):
+        super().__init__()
+        self.network = network
+
+    def forward(self, x_ts, x_demo, y=None, dataset_size=None):
+        return self.network(x_ts, x_demo)  # no observation site is needed for prediction
+
+
+# ---- late-fusion Bayesian ----
+class BayesianDemographicMLP(PyroModule):
+    def __init__(self, input_dim, output_dim=16):
+        super().__init__()
+        self.fc1 = PyroBayesianLinear(input_dim, 32)
+        self.fc2 = PyroBayesianLinear(32, output_dim)
+        self.relu = nn.GELU()
+
+    def forward(self, x):
+        return self.relu(self.fc2(self.relu(self.fc1(x))))
+
+
+class BayesianLateFusionHeartDiseaseNet(PyroModule):
+    def __init__(self, in_channels=12, demog_dim=8, num_classes=2):
+        super().__init__()
+        self.conv1 = PyroBayesianConv1d(in_channels, 16, kernel_size=15, padding=7)
+        self.pool1 = nn.AvgPool1d(kernel_size=10)
+        self.conv2 = PyroBayesianConv1d(16, 32, kernel_size=9, padding=4)
+        self.pool2 = nn.AvgPool1d(kernel_size=10)
+        self.conv3 = PyroBayesianConv1d(32, 32, kernel_size=5, padding=2)
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.relu = nn.GELU()
+        self.demog_features = BayesianDemographicMLP(demog_dim, output_dim=16)
+        self.fc_out1 = PyroBayesianLinear(32 + 16, 32)
+        self.fc_out2 = PyroBayesianLinear(32, num_classes)
+
+    def forward(self, ts_input, demog_input):
+        x = self.pool1(self.relu(self.conv1(ts_input)))
+        x = self.pool2(self.relu(self.conv2(x)))
+        ts_embedding = torch.flatten(self.gap(self.relu(self.conv3(x))), start_dim=1)
+        fused = torch.cat((ts_embedding, self.demog_features(demog_input)), dim=1)
+        return self.fc_out2(self.relu(self.fc_out1(fused)))
+
+
+class PyroLateFusionClassifier(PyroModule):
+    def __init__(self, network):
+        super().__init__()
+        self.network = network
+
+    def forward(self, x_ts, x_demo, y=None, dataset_size=None):
+        return self.network(x_ts, x_demo)
+
+
+def build_mean_field_guide(model):
+    return AutoNormal(model, init_scale=float(F.softplus(torch.tensor(POSTERIOR_RHO_INIT))))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 4. MODEL LOADING
+# ──────────────────────────────────────────────────────────────────────
+def _torch_load(path, device):
+    return torch.load(path, map_location=device, weights_only=False)
+
+
+def load_pyro_model(path, kind, device, example_ts, example_demo):
+    """Rebuild the architecture, then restore BN buffers + variational posterior."""
+    ckpt = _torch_load(path, device)
+    for key, name in (("sigma_1", "prior_sigma_1"), ("sigma_2", "prior_sigma_2"), ("pi", "prior_pi")):
+        if name in ckpt:
+            PRIOR[key] = float(ckpt[name])
+
+    in_channels, demo_dim = int(ckpt["in_channels"]), int(ckpt["demo_dim"])
+    num_classes = int(ckpt.get("num_classes", 2))
+    if kind == "early_bayes":
+        net = BayesianHeartDiseaseNet(int(ckpt.get("sequence_length", 2500)), in_channels, demo_dim,
+                                      num_classes, int(ckpt.get("demo_embed_dim", 16)))
+        model = PyroHeartDiseaseClassifier(net)
+    else:
+        net = BayesianLateFusionHeartDiseaseNet(in_channels, demo_dim, num_classes)
+        model = PyroLateFusionClassifier(net)
+
+    pyro.clear_param_store()  # the param store is global: one Bayesian model at a time
+    model = model.to(device)
+    result = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if result.unexpected_keys:
+        print(f"    [warn] unexpected keys in model_state_dict: {result.unexpected_keys[:5]}")
+    if result.missing_keys:
+        print(f"    [warn] missing keys in model_state_dict: {result.missing_keys[:5]}")
+
+    guide = build_mean_field_guide(model).to(device)
+    model.eval()
+    guide.eval()
+    guide(example_ts, example_demo, None, None)  # AutoNormal creates its params lazily
+    pyro.get_param_store().set_state(ckpt["pyro_param_store_state"])
+
+    # Sanity check: restored posterior medians must equal those stored at training time.
+    if "posterior_median_weights" in ckpt:
+        with torch.no_grad():
+            med = guide.median(example_ts, example_demo, None, None)
+        diffs = [float((med[k].detach().cpu() - v.detach().cpu()).abs().max())
+                 for k, v in ckpt["posterior_median_weights"].items() if k in med]
+        if not diffs:
+            print("    [warn] could not compare posterior medians (no common site names)")
+        elif max(diffs) > 1e-5:
+            raise RuntimeError(f"Posterior failed to restore correctly (max |diff| = {max(diffs):.3e}). "
+                               "Check that the architecture matches the checkpoint.")
+        else:
+            print(f"    posterior restored OK (max |median diff| = {max(diffs):.1e})")
+    return model, guide, extract_prep_from_checkpoint(ckpt)
+
+
+def load_deterministic_model(path, kind, device):
+    obj = _torch_load(path, device)
+    if isinstance(obj, nn.Module):  # a fully pickled model
+        return obj.to(device).eval(), None, None
+    sd = obj["model_state_dict"] if isinstance(obj, dict) and "model_state_dict" in obj else obj
+    sd = {k.replace("module.", "", 1): v for k, v in sd.items()}  # DataParallel prefix
+
+    # Infer architecture hyper-parameters from the tensor shapes
+    if kind == "late_cnn":
+        in_ch = sd["ts_features.0.weight"].shape[1]
+        demog_dim = sd["demog_features.mlp.0.weight"].shape[1]
+        embed = sd["demog_features.mlp.4.weight"].shape[0]
+        model = LateFusionHeartDiseaseModel(2500, 2, in_ch, demog_dim, embed)
+    else:
+        in_ch = sd["conv1.weight"].shape[1]
+        demog_dim = sd["demog_features.0.weight"].shape[1]
+        embed = sd["demog_features.4.weight"].shape[0]
+        model = HeartDiseaseModel(2500, 2, in_ch, demog_dim, embed)
+    print(f"    inferred: in_channels={in_ch}, demog_dim={demog_dim}, demo_embed_dim={embed}")
+    model.load_state_dict(sd, strict=True)
+    return model.to(device).eval(), extract_prep_from_checkpoint(obj), int(demog_dim)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 5. INFERENCE
+# ──────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def predict_deterministic(model, X, demo, batch_size, device):
+    out = np.zeros(len(X), dtype=np.float64)
+    for s in range(0, len(X), batch_size):
+        xb = torch.from_numpy(X[s:s + batch_size]).to(device)
+        db = torch.from_numpy(demo[s:s + batch_size]).to(device)
+        out[s:s + batch_size] = torch.softmax(model(xb, db), -1)[:, 1].cpu().numpy()
+    return out
+
+
+@torch.no_grad()
+def predict_bayesian(model, guide, X, demo, mc_samples, batch_size, device):
+    """Return an (S, N) float32 matrix of P(SHD) posterior draws.
+
+    Weights are re-sampled for every (batch, draw) pair. Every COLUMN is therefore a valid
+    sample from that ECG's predictive posterior, but a ROW is not one coherent network, so the
+    matrix must only be used for per-ECG summaries (mean, 95% interval, share of draws on each
+    side of the threshold). That is exactly what find_inconclusive_patients.py computes.
+    """
+    draws = np.zeros((mc_samples, len(X)), dtype=np.float32)
+    n_batches = int(np.ceil(len(X) / batch_size))
+    for b, s in enumerate(range(0, len(X), batch_size)):
+        xb = torch.from_numpy(X[s:s + batch_size]).to(device)
+        db = torch.from_numpy(demo[s:s + batch_size]).to(device)
+        for j in range(mc_samples):
+            trace = poutine.trace(guide).get_trace(xb, db, None, None)
+            logits = poutine.replay(model, trace=trace)(xb, db, None, None)
+            draws[j, s:s + len(xb)] = torch.softmax(logits, -1)[:, 1].cpu().numpy()
+        print(f"    batch {b + 1}/{n_batches}", end="\r", flush=True)
+    print(" " * 40, end="\r")
+    return draws
+
+
+def build_demo_array(demo_dim, prep, knn_k, split_meta, train_meta, data_dir, split):
+    """Demographic input whose width matches the trained model.
+
+    * width 7  -> the dataset's own pre-processed EchoNext_<split>_tabular_features.npy
+                  (sex, 5 ECG intervals/rates, age; no race one-hot)
+    * otherwise-> the metadata pipeline used by the 100K training scripts
+                  (6 continuous + one-hot race + one-hot sex = 14 columns)
+    """
+    if demo_dim == 7:
+        path = os.path.join(data_dir, f"EchoNext_{split}_tabular_features.npy")
+        if not os.path.exists(path):
+            sys.exit(f"Model expects 7 demographic features but {path} was not found.")
+        arr = np.load(path).astype(np.float32)
+        if arr.shape != (len(split_meta), 7):
+            sys.exit(f"{path} has shape {arr.shape}, expected ({len(split_meta)}, 7)")
+        print("    demo_dim == 7 -> using the dataset's preprocessed tabular_features.npy")
+        return arr
+    if prep is None:
+        print(f"    no preprocessing objects stored -> refitting imputer/scaler on train split (k={knn_k})")
+        prep = fit_demographic_preprocessor(train_meta, knn_k)
+    arr = transform_demographics(split_meta, prep)
+    if demo_dim is not None and arr.shape[1] != demo_dim:
+        sys.exit(f"Model expects {demo_dim} demographic features but the metadata pipeline produced "
+                 f"{arr.shape[1]}. The checkpoint was trained with a different demographic encoding.")
+    return arr
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 6. POSTERIOR SUMMARIES + SUBGROUP METRICS
+# ──────────────────────────────────────────────────────────────────────
+def summarize_draws(draws, threshold, minority_frac_min):
+    """Same definition as find_inconclusive_patients.py::summarize.
+
+    A patient is INCONCLUSIVE when (a) the central 95% interval of the posterior draws contains
+    the decision threshold AND (b) at least `minority_frac_min` of the draws fall on the opposite
+    side of the threshold from the majority. Everything else is CONCLUSIVE.
+    """
+    mean = draws.mean(0, dtype=np.float64)
+    lo, hi = np.quantile(draws, [0.025, 0.975], axis=0)
+    frac_pos = (draws >= threshold).mean(0)
+    minority = np.minimum(frac_pos, 1.0 - frac_pos)
+    straddle = (lo < threshold) & (hi > threshold)
+    return {"prob": mean, "lower_95": lo, "upper_95": hi, "minority_frac": minority,
+            "inconclusive": straddle & (minority >= minority_frac_min)}
+
+
+def wilson_ci(k, n, z=1.96):
+    if n == 0:
+        return np.nan, np.nan
+    p = k / n
+    denom = 1 + z ** 2 / n
+    centre = (p + z ** 2 / (2 * n)) / denom
+    half = z * np.sqrt(p * (1 - p) / n + z ** 2 / (4 * n ** 2)) / denom
+    return centre - half, centre + half
+
+
+def group_metrics(probs, labels, mask, threshold=0.5, incon=None):
+    p, y = probs[mask], labels[mask]
+    n = int(mask.sum())
+    if n == 0:
+        return {"n": 0}
+    pred = (p >= threshold).astype(int)
+    right = pred == y
+    tp = int(((pred == 1) & (y == 1)).sum()); tn = int(((pred == 0) & (y == 0)).sum())
+    fp = int(((pred == 1) & (y == 0)).sum()); fn = int(((pred == 0) & (y == 1)).sum())
+    lo, hi = wilson_ci(tp + tn, n)
+    out = {
+        "n": n,
+        "n_shd": int(y.sum()),
+        "shd_prevalence": y.mean(),
+        "accuracy": (tp + tn) / n,
+        "acc_ci_lo": lo, "acc_ci_hi": hi,
+        "sensitivity": tp / (tp + fn) if (tp + fn) else np.nan,
+        "specificity": tn / (tn + fp) if (tn + fp) else np.nan,
+        "auroc": roc_auc_score(y, p) if len(np.unique(y)) == 2 else np.nan,
+    }
+    if incon is not None:  # Bayesian models only
+        inc = incon[mask]
+        n_inc = int(inc.sum())
+        ilo, ihi = wilson_ci(n_inc, n)
+        out.update({
+            "n_inconclusive": n_inc, "n_conclusive": n - n_inc,
+            "pct_inconclusive": n_inc / n, "incon_ci_lo": ilo, "incon_ci_hi": ihi,
+            "acc_conclusive": right[~inc].mean() if (~inc).any() else np.nan,
+            "acc_inconclusive": right[inc].mean() if inc.any() else np.nan,
+        })
+    return out
+
+
+def joint_inconclusive_metrics(incon_early, incon_late, mask):
+    n = int(mask.sum())
+    if n == 0:
+        return {"n": 0}
+    e, l = incon_early[mask], incon_late[mask]
+    return {"n": n, "n_incon_early": int(e.sum()), "n_incon_late": int(l.sum()),
+            "n_both": int((e & l).sum()), "pct_incon_early": e.mean(), "pct_incon_late": l.mean(),
+            "pct_both": (e & l).mean()}
+
+
+MARGINAL_TYPES = ("Overall", "Age", "Race/Ethnicity")
+
+
+def build_groups(meta, intersections=True):
+    """Marginal groups (overall / age / race) and age x race intersection cells."""
+    age = pd.to_numeric(meta["age_at_ecg"], errors="coerce")
+    age_grp = pd.cut(age, AGE_BINS, labels=AGE_LABELS, right=False).astype(object)
+    race = meta["race_ethnicity"].astype("string").str.strip().str.capitalize()
+    ones = np.ones(len(meta), dtype=bool)
+
+    # "<18" is not in the reference table; it is shown only if such ECGs exist.
+    age_levels = [l for l in AGE_LABELS if l != "<18" or (age_grp == l).any()]
+    age_masks = {l: (age_grp == l).to_numpy(dtype=bool) for l in age_levels}
+    race_levels = list(RACE_ORDER) + sorted(set(race.dropna().unique()) - set(RACE_ORDER))
+    race_masks = {l: (race == l).fillna(False).to_numpy(dtype=bool) for l in race_levels}
+
+    def G(gtype, name, mask, ref, a, r):
+        return {"group_type": gtype, "group": name, "mask": mask, "ref_pct": ref,
+                "age_group": a, "race_group": r}
+
+    groups = [G("Overall", "All", ones, 100.0, "All", "All")]
+    for l in age_levels:
+        groups.append(G("Age", l, age_masks[l], REF_AGE_PCT.get(l, np.nan), l, "All"))
+    if age.isna().any():
+        groups.append(G("Age", "Missing", age.isna().to_numpy(), np.nan, "Missing", "All"))
+    for l in race_levels:
+        groups.append(G("Race/Ethnicity", l, race_masks[l], REF_RACE_PCT.get(l, np.nan), "All", l))
+    if race.isna().any():
+        groups.append(G("Race/Ethnicity", "Missing", race.isna().to_numpy(), np.nan, "All", "Missing"))
+    if intersections:
+        for a in age_levels:
+            for r in race_levels:
+                groups.append(G("Age x Race/Ethnicity", f"{a} | {r}", age_masks[a] & race_masks[r],
+                                np.nan, a, r))
+    return groups, age_levels, race_levels
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 7. REPORTING
+# ──────────────────────────────────────────────────────────────────────
+SHORT_NAME = {"Early-fusion Bayesian": "Early-B", "Late-fusion Bayesian": "Late-B",
+              "Early-fusion CNN": "Early-CNN", "Late-fusion CNN": "Late-CNN"}
+
+
+def _fmt_pct(x, d=1):
+    return "-" if pd.isna(x) else f"{100 * x:.{d}f}"
+
+
+def _marginal(df):
+    return df[df["group_type"].isin(MARGINAL_TYPES)]
+
+
+def format_model_table(df):
+    """Human-readable marginal table for one model (adds inconclusive columns if available)."""
+    show_incon = "n_inconclusive" in df.columns and df["n_inconclusive"].notna().any()
+    rows = []
+    for _, r in _marginal(df).iterrows():
+        small = "*" if 0 < r["n"] < 30 else ""
+        if r["n"] == 0:
+            acc = "-"
+        else:
+            acc = f"{_fmt_pct(r['accuracy'])} [{_fmt_pct(r['acc_ci_lo'])}, {_fmt_pct(r['acc_ci_hi'])}]"
+        row = {
+            "Type": r["group_type"], "Group": r["group"] + small, "n": int(r["n"]),
+            "% of split": _fmt_pct(r["pct_of_split"] / 100),
+            "SHD prev %": _fmt_pct(r.get("shd_prevalence")),
+            "Accuracy % [95% CI]": acc,
+            "Sens %": _fmt_pct(r.get("sensitivity")), "Spec %": _fmt_pct(r.get("specificity")),
+            "AUROC": "-" if pd.isna(r.get("auroc")) else f"{r['auroc']:.3f}",
+        }
+        if show_incon:
+            row["Inconclusive n (%)"] = ("-" if r["n"] == 0 else
+                                         f"{int(r['n_inconclusive'])} ({_fmt_pct(r['pct_inconclusive'])})")
+            row["Acc | conclusive %"] = _fmt_pct(r.get("acc_conclusive"))
+            row["Acc | inconclusive %"] = _fmt_pct(r.get("acc_inconclusive"))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def df_to_markdown(df):
+    cols = list(df.columns)
+    lines = ["| " + " | ".join(cols) + " |", "|" + "|".join("---" for _ in cols) + "|"]
+    for _, r in df.iterrows():
+        lines.append("| " + " | ".join(str(r[c]) for c in cols) + " |")
+    return "\n".join(lines)
+
+
+def build_wide_accuracy_table(long_df, model_names):
+    marg = _marginal(long_df)
+    first = marg[marg["model"] == model_names[0]]
+    rows = []
+    for _, g in first.iterrows():
+        row = {"Type": g["group_type"], "Group": g["group"], "n": int(g["n"]),
+               "% of split": _fmt_pct(g["pct_of_split"] / 100),
+               "Ref % (full 100K)": "-" if pd.isna(g["ref_pct"]) else f"{g['ref_pct']:.2f}"}
+        for m in model_names:
+            r = marg[(marg["model"] == m) & (marg["group_type"] == g["group_type"])
+                     & (marg["group"] == g["group"])].iloc[0]
+            row[SHORT_NAME.get(m, m)] = "-" if r["n"] == 0 else _fmt_pct(r["accuracy"])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_inconclusive_summary(long_df, joint_df, bayes_names):
+    """Conclusive vs inconclusive breakdown for the marginal groups (Bayesian models only)."""
+    marg = _marginal(long_df)
+    first = marg[marg["model"] == bayes_names[0]]
+    rows = []
+    for _, g in first.iterrows():
+        row = {"Type": g["group_type"], "Group": g["group"], "n": int(g["n"])}
+        for m in bayes_names:
+            r = marg[(marg["model"] == m) & (marg["group_type"] == g["group_type"])
+                     & (marg["group"] == g["group"])].iloc[0]
+            t = SHORT_NAME.get(m, m)
+            if r["n"] == 0:
+                row[f"{t} incon. n (%)"] = row[f"{t} acc|concl %"] = row[f"{t} acc|incon %"] = "-"
+            else:
+                row[f"{t} incon. n (%)"] = f"{int(r['n_inconclusive'])} ({_fmt_pct(r['pct_inconclusive'])})"
+                row[f"{t} acc|concl %"] = _fmt_pct(r["acc_conclusive"])
+                row[f"{t} acc|incon %"] = _fmt_pct(r["acc_inconclusive"])
+        if joint_df is not None:
+            j = joint_df[(joint_df["group_type"] == g["group_type"]) & (joint_df["group"] == g["group"])].iloc[0]
+            row["Both incon. n (%)"] = "-" if j["n"] == 0 else f"{int(j['n_both'])} ({_fmt_pct(j['pct_both'])})"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def make_matrix(rows, value_col, n_col, age_levels, race_levels, min_cell, kind="pct"):
+    """Age (rows) x race (columns) matrix with an 'All' margin on each axis.
+
+    Cells whose supporting sample (n_col) is below `min_cell` are starred; empty cells show '-'.
+    """
+    lookup = {(r["age_group"], r["race_group"]): r for _, r in rows.iterrows()}
+    ages, races = list(age_levels) + ["All"], list(race_levels) + ["All"]
+    out = []
+    for a in ages:
+        row = {"Age": a}
+        for c in races:
+            r = lookup.get((a, c))
+            if r is None or pd.isna(r.get(n_col)) or r[n_col] == 0 or pd.isna(r.get(value_col)):
+                row[c] = "-"
+            elif kind == "int":
+                row[c] = str(int(r[value_col]))
+            else:
+                row[c] = f"{100 * r[value_col]:.1f}" + ("*" if r[n_col] < min_cell else "")
+        out.append(row)
+    return pd.DataFrame(out)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 8. MAIN
+# ──────────────────────────────────────────────────────────────────────
+def find_metadata(data_dir):
+    for f in glob.glob(os.path.join(data_dir, "*")):
+        if os.path.basename(f).lower() == "echonext_metadata_100k.csv":
+            return f
+    raise FileNotFoundError(f"echonext_metadata_100k.csv not found in {data_dir}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--data-dir", default="../EchoNextData")
+    p.add_argument("--split", default="test", choices=["test", "val", "train"])
+    p.add_argument("--label", default="shd_moderate_or_greater_flag")
+    p.add_argument("--early-bayes"); p.add_argument("--late-bayes")
+    p.add_argument("--early-cnn"); p.add_argument("--late-cnn")
+    p.add_argument("--out-dir", default="subgroup_results")
+    p.add_argument("--mc-samples", type=int, default=200,
+                   help="posterior draws per ECG for Bayesian models (200 = find_inconclusive default)")
+    p.add_argument("--threshold", type=float, default=0.5,
+                   help="decision threshold for accuracy AND for the inconclusive straddle test")
+    p.add_argument("--minority-frac", type=float, default=0.20,
+                   help="inconclusive if >= this share of posterior draws fall on the opposite side "
+                        "of the threshold (and the 95%% interval straddles it)")
+    p.add_argument("--min-cell", type=int, default=30, help="cells with fewer ECGs are starred")
+    p.add_argument("--no-intersections", action="store_true", help="skip age x race cells")
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--late-cnn-knn-k", type=int, default=3, help="KNN k used when training the late-fusion CNN")
+    p.add_argument("--early-cnn-knn-k", type=int, default=5, help="KNN k used when training the early-fusion CNN")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--recompute", action="store_true", help="ignore cached per-ECG predictions")
+    p.add_argument("--seed", type=int, default=42)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    torch.manual_seed(args.seed); np.random.seed(args.seed); pyro.set_rng_seed(args.seed)
+    device = torch.device(args.device)
+    os.makedirs(args.out_dir, exist_ok=True)
+    print(f"Device: {device}", flush=True)
+
+    requested = [k for k in MODEL_REGISTRY if getattr(args, MODEL_REGISTRY[k][0])]
+    if not requested:
+        sys.exit("Provide at least one of --early-bayes / --late-bayes / --early-cnn / --late-cnn")
+
+    # ---- metadata + split ----
+    meta = pd.read_csv(find_metadata(args.data_dir))
+    split_meta = meta[meta["split"] == args.split]
+    train_meta = meta[meta["split"] == "train"]
+    labels = split_meta[args.label].to_numpy().astype(int)
+    n_total = len(split_meta)
+    print(f"{args.split} split: {n_total} ECGs, {labels.mean():.1%} positive for {args.label}", flush=True)
+
+    # ---- waveforms (filtered once, shared by all models) ----
+    wf_path = os.path.join(args.data_dir, f"EchoNext_{args.split}_waveforms.npy")
+    t0 = time.time()
+    X = load_filtered_waveforms(wf_path)
+    print(f"Filtered waveforms {X.shape} in {time.time() - t0:.0f}s", flush=True)
+    if len(X) != n_total:
+        sys.exit(f"Row mismatch: {len(X)} waveforms vs {n_total} metadata rows for split '{args.split}'")
+
+    groups, age_levels, race_levels = build_groups(split_meta.reset_index(drop=True),
+                                                   intersections=not args.no_intersections)
+
+    long_rows, display_names, bayes_names = [], [], []
+    incon_flags = {}
+    for key in requested:
+        flag, display, kind, default_k = MODEL_REGISTRY[key]
+        path = getattr(args, flag)
+        is_bayes = kind in ("early_bayes", "late_bayes")
+        print(f"\n=== {display} ({path}) ===", flush=True)
+        cache = os.path.join(args.out_dir, f"preds_{key}_{args.split}.npz")
+
+        draws = prob = None
+        if os.path.exists(cache) and not args.recompute:
+            z = np.load(cache)
+            if is_bayes and "draws" in z.files and z["draws"].shape == (args.mc_samples, n_total):
+                draws = z["draws"]
+            elif not is_bayes and "prob" in z.files and len(z["prob"]) == n_total:
+                prob = z["prob"]
+            print(f"    loaded cached predictions from {cache}" if (draws is not None or prob is not None)
+                  else "    cache does not match this run (shape / mc-samples) -> recomputing")
+
+        if draws is None and prob is None:
+            if is_bayes:
+                ckpt_peek = _torch_load(path, "cpu")
+                prep, demo_dim = extract_prep_from_checkpoint(ckpt_peek), int(ckpt_peek["demo_dim"])
+                del ckpt_peek
+                demo = build_demo_array(demo_dim, prep, 5, split_meta, train_meta, args.data_dir, args.split)
+                ex_ts = torch.from_numpy(X[:1]).to(device)
+                ex_demo = torch.from_numpy(demo[:1]).to(device)
+                model, guide, _ = load_pyro_model(path, kind, device, ex_ts, ex_demo)
+                draws = predict_bayesian(model, guide, X, demo, args.mc_samples, args.batch_size, device)
+                del model, guide
+                pyro.clear_param_store()
+                np.savez_compressed(cache, draws=draws)
+            else:
+                model, prep, demo_dim = load_deterministic_model(path, kind, device)
+                k = args.late_cnn_knn_k if kind == "late_cnn" else args.early_cnn_knn_k
+                demo = build_demo_array(demo_dim, prep, k, split_meta, train_meta, args.data_dir, args.split)
+                prob = predict_deterministic(model, X, demo, args.batch_size, device)
+                del model
+                np.savez_compressed(cache, prob=prob)
+
+        if is_bayes:
+            summ = summarize_draws(draws, args.threshold, args.minority_frac)
+            probs, incon = summ["prob"], summ["inconclusive"]
+            incon_flags[key] = incon
+            bayes_names.append(display)
+            per_ecg = pd.DataFrame({
+                "metadata_index": split_meta.index, "true_label": labels,
+                "age_at_ecg": split_meta["age_at_ecg"].to_numpy(),
+                "race_ethnicity": split_meta["race_ethnicity"].to_numpy(),
+                "posterior_mean": summ["prob"], "lower_95": summ["lower_95"], "upper_95": summ["upper_95"],
+                "minority_frac": summ["minority_frac"], "inconclusive": incon,
+                "predicted_label": (probs >= args.threshold).astype(int),
+            })
+            per_ecg.to_csv(os.path.join(args.out_dir, f"per_ecg_posterior_{key}_{args.split}.csv"), index=False)
+        else:
+            probs, incon = np.asarray(prob, dtype=np.float64), None
+
+        acc = float(((probs >= args.threshold).astype(int) == labels).mean())
+        msg = f"    overall accuracy = {acc:.4f}"
+        if incon is not None:
+            msg += f" | inconclusive = {incon.mean():.1%}"
+        print(msg, flush=True)
+        display_names.append(display)
+
+        for g in groups:
+            mask = g["mask"]
+            row = {"model": display, "group_type": g["group_type"], "group": g["group"],
+                   "age_group": g["age_group"], "race_group": g["race_group"], "ref_pct": g["ref_pct"],
+                   "pct_of_split": 100 * mask.sum() / n_total}
+            row.update(group_metrics(probs, labels, mask, args.threshold, incon))
+            long_rows.append(row)
+
+    long_df = pd.DataFrame(long_rows)
+    long_df.to_csv(os.path.join(args.out_dir, f"subgroup_results_long_{args.split}.csv"), index=False)
+
+    # ---- joint inconclusive (both Bayesian models) ----
+    joint_df = None
+    if "early_bayes" in incon_flags and "late_bayes" in incon_flags:
+        jrows = []
+        for g in groups:
+            row = {k: g[k] for k in ("group_type", "group", "age_group", "race_group")}
+            row.update(joint_inconclusive_metrics(incon_flags["early_bayes"], incon_flags["late_bayes"], g["mask"]))
+            jrows.append(row)
+        joint_df = pd.DataFrame(jrows)
+        joint_df.to_csv(os.path.join(args.out_dir, f"subgroup_joint_inconclusive_{args.split}.csv"), index=False)
+
+    # ---- report ----
+    md = [f"# Subgroup performance on the `{args.split}` split\n",
+          f"Label: `{args.label}`; decision threshold {args.threshold}; n = {n_total}. "
+          "Accuracy CIs are 95% Wilson intervals. Age 90 is a capped value, so `90+` means ages >= 90. "
+          "`*` = fewer than the minimum cell size of ECGs (interpret with caution).\n",
+          "**Bayesian models**: posterior-mean probability from "
+          f"{args.mc_samples} weight draws per ECG. An ECG is *inconclusive* when the 95% interval of its "
+          f"draws contains {args.threshold} AND at least {args.minority_frac:.0%} of the draws fall on the "
+          "opposite side of the threshold from the majority (same rule as `find_inconclusive_patients.py`); "
+          "otherwise it is *conclusive*. The deterministic CNNs produce a single probability, so "
+          "inconclusive/conclusive is not defined for them.\n"]
+
+    wide = build_wide_accuracy_table(long_df, display_names)
+    wide.to_csv(os.path.join(args.out_dir, f"subgroup_accuracy_wide_{args.split}.csv"), index=False)
+    print("\n" + "=" * 100 + "\nACCURACY (%) BY SUBGROUP AND MODEL\n" + "=" * 100)
+    print(wide.to_string(index=False))
+    md += ["## Accuracy (%) by subgroup and model\n", df_to_markdown(wide), ""]
+
+    if bayes_names:
+        summ_tbl = build_inconclusive_summary(long_df, joint_df, bayes_names)
+        summ_tbl.to_csv(os.path.join(args.out_dir, f"subgroup_inconclusive_summary_{args.split}.csv"), index=False)
+        print("\n" + "=" * 100 + "\nINCONCLUSIVE vs CONCLUSIVE BY SUBGROUP (Bayesian models)\n" + "=" * 100)
+        print(summ_tbl.to_string(index=False))
+        md += ["## Inconclusive vs conclusive cases by subgroup (Bayesian models)\n",
+               "`acc|concl` / `acc|incon` = accuracy among conclusive / inconclusive ECGs of the group. "
+               "`Both incon.` = inconclusive under both Bayesian models.\n",
+               df_to_markdown(summ_tbl), ""]
+
+    for name in display_names:
+        tbl = format_model_table(long_df[long_df["model"] == name])
+        print(f"\n--- {name} ---")
+        print(tbl.to_string(index=False))
+        md += [f"## {name}\n", df_to_markdown(tbl), ""]
+
+    if not args.no_intersections:
+        n_mat = make_matrix(long_df[long_df["model"] == display_names[0]], "n", "n",
+                            age_levels, race_levels, args.min_cell, kind="int")
+        print("\n" + "=" * 100 + f"\nAGE x RACE/ETHNICITY INTERSECTIONS (rows: age, columns: race; * = n < {args.min_cell})\n"
+              + "=" * 100)
+        print("\nECGs per cell"); print(n_mat.to_string(index=False))
+        md += ["## Age x race/ethnicity intersections\n", f"Starred cells have fewer than {args.min_cell} ECGs "
+               "(for the conclusive/inconclusive accuracy matrices the star refers to the size of that "
+               "subset). Margins (`All`) are the marginal groups above.\n",
+               "### ECGs per cell\n", df_to_markdown(n_mat), ""]
+        for name in display_names:
+            rows = long_df[long_df["model"] == name]
+            is_b = name in bayes_names
+            specs = [("Accuracy (%)", "accuracy", "n", True)]
+            if is_b:
+                specs += [("Inconclusive (% of ECGs)", "pct_inconclusive", "n", True),
+                          ("Accuracy among conclusive ECGs (%)", "acc_conclusive", "n_conclusive", False),
+                          ("Accuracy among inconclusive ECGs (%)", "acc_inconclusive", "n_inconclusive", False)]
+            for title, vcol, ncol, to_console in specs:
+                mat = make_matrix(rows, vcol, ncol, age_levels, race_levels, args.min_cell)
+                mat.to_csv(os.path.join(args.out_dir, f"matrix_{SHORT_NAME.get(name, name)}_{vcol}_{args.split}.csv"),
+                           index=False)
+                if to_console:
+                    print(f"\n{name}: {title}"); print(mat.to_string(index=False))
+                md += [f"### {name}: {title}\n", df_to_markdown(mat), ""]
+        if joint_df is not None:
+            mat = make_matrix(joint_df, "pct_both", "n", age_levels, race_levels, args.min_cell)
+            mat.to_csv(os.path.join(args.out_dir, f"matrix_both_inconclusive_{args.split}.csv"), index=False)
+            print("\nInconclusive under BOTH Bayesian models (% of ECGs)"); print(mat.to_string(index=False))
+            md += ["### Inconclusive under BOTH Bayesian models (% of ECGs)\n", df_to_markdown(mat), ""]
+
+    with open(os.path.join(args.out_dir, f"subgroup_report_{args.split}.md"), "w") as f:
+        f.write("\n".join(md))
+    print(f"\nSaved CSVs, cached predictions and Markdown report to: {args.out_dir}")
+
+
+if __name__ == "__main__":
+    main()
